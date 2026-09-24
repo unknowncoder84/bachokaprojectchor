@@ -1,646 +1,379 @@
 # VoiceShield
 
-## Local AI-Powered Voice Deepfake Detection
+Voice deepfake / spoof detection app. React + TypeScript frontend, FastAPI
+backend, ONNX-based ML inference.
 
-VoiceShield is a local voice-analysis application that detects whether a
-speech recording is likely to be **real human speech** or
-**synthetically generated / spoofed speech**.
+> **Read this first:** the real ML model file is **not included** in this
+> repository. Right now the backend runs in a **demo/heuristic fallback
+> mode** that does not perform real detection. See
+> [Current status: demo mode](#current-status-demo-mode) before you judge
+> any prediction it gives you. Everything else described here (build,
+> run, deploy) is fully working and verified.
 
-The project contains three main parts:
+---
 
--   **Frontend** --- React + TypeScript + Vite user interface
--   **Backend** --- Python + FastAPI REST API
--   **ML Model** --- Local ONNX-based Wav2Vec2 AntiDeepfake inference
+## Table of contents
 
-> **Current status:** The application is working end-to-end locally.
-> Audio can be uploaded or recorded through the browser, sent to the
-> local FastAPI backend, analyzed by the local ML model, and returned
-> with a prediction, confidence, and risk level.
+- [Current status: demo mode](#current-status-demo-mode)
+- [Project structure](#project-structure)
+- [Prerequisites](#prerequisites)
+- [Run from scratch (local)](#run-from-scratch-local)
+- [Getting the real ML model working](#getting-the-real-ml-model-working)
+- [Deploy live (Netlify + Render, free)](#deploy-live-netlify--render-free)
+- [API reference](#api-reference)
+- [Troubleshooting](#troubleshooting)
+- [Disclaimer](#disclaimer)
 
-------------------------------------------------------------------------
+---
 
-# Project Structure
+## Current status: demo mode
 
-``` text
-VoiceShield_local_ML_connected/
-│
+The detection model this project was designed around is
+`Wav2Vec2-Small-AntiDeepfake`, exported to ONNX
+(`ml/models/antideepfake/wav2vec2-small-antideepfake.onnx`, ~377 MB).
+That file was originally distributed via Git LFS and was **never actually
+present** in this checkout — only a small placeholder is committed at
+`ml/models/antideepfake/wav2vec2-small-antideepfake.onnx.placeholder`.
+
+Because of that, `backend/app/model_service.py` automatically falls back
+to a `DemoHeuristicModel`: it hashes the uploaded audio file's raw bytes
+and returns a result based on the hash. **It does not listen to or
+analyze the audio at all.** Same file → same result, every time. A real
+human recording can just as easily hash to "SYNTHETIC" as to "REAL" —
+that's expected and not a bug.
+
+You can tell which mode is active by calling `/health`:
+
+```json
+{ "status": "ok", "model_loaded": true, "device": "CPU", "demo_mode": true }
+```
+
+`"demo_mode": true` means you're seeing heuristic output, not real ML.
+See [Getting the real ML model working](#getting-the-real-ml-model-working)
+to fix this.
+
+---
+
+## Project structure
+
+```
+VoiceShield/
+├── api/index.py                  # Lightweight demo API (Vercel serverless entry point)
+├── app.py                        # Alternate ASGI entry point mounting the real backend app
 ├── backend/
-│   └── app/
-│       ├── main.py
-│       ├── model_service.py
-│       └── risk_engine.py
-│
+│   ├── app/
+│   │   ├── main.py                # FastAPI app: /health, /predict, /history, /model-info
+│   │   ├── model_service.py       # Loads ONNX model OR falls back to demo heuristic
+│   │   └── risk_engine.py         # Converts probability -> risk score/level/recommendation
+│   └── requirements.txt
 ├── frontend/
-│   ├── public/
-│   │   └── samples/
-│   │       ├── real_sample.wav
-│   │       └── spoof_sample.wav
-│   │
 │   ├── src/
-│   │   ├── components/
-│   │   │   ├── UploadScreen.tsx
-│   │   │   ├── LiveDetectionScreen.tsx
-│   │   │   ├── DetailedAnalysisScreen.tsx
-│   │   │   └── ...
-│   │   │
-│   │   ├── services/
+│   │   ├── components/            # UploadScreen, LiveDetectionScreen, Dashboard, etc.
+│   │   ├── config.ts              # API_BASE_URL (reads VITE_API_BASE_URL at build time)
 │   │   └── ...
-│   │
+│   ├── server.ts                  # Express+Vite dev/prod server (local dev only)
 │   ├── package.json
-│   ├── vite.config.*
-│   └── ...
-│
+│   └── vite.config.ts
 ├── ml/
-│   └── models/
-│       └── antideepfake/
-│           └── wav2vec2-small-antideepfake.onnx
-│
-├── README.md
-└── ...
+│   ├── models/
+│   │   ├── antideepfake/           # Real ONNX model goes here (not included)
+│   │   ├── checkpoints/            # PyTorch checkpoints from ml/training/train.py
+│   │   └── cnn_baseline.py         # Simple CNN architecture (alternative to Wav2Vec2)
+│   ├── preprocessing/audio_preprocessing.py
+│   ├── training/                   # train.py / dataset.py — train your own model from a dataset
+│   ├── evaluation/evaluate.py      # Accuracy / F1 / ROC-AUC / EER on a held-out set
+│   └── requirements.txt
+├── netlify.toml                   # Netlify build config (frontend)
+├── render.yaml                    # Render build config (backend)
+└── vercel.json                    # Optional: alternate all-in-one Vercel deploy (demo mode)
 ```
 
-------------------------------------------------------------------------
+---
 
-# Frontend
+## Prerequisites
 
-The frontend is the user-facing part of VoiceShield.
+- **Node.js** 18+ and npm
+- **Python** 3.12 (see `.python-version`)
+- **Git**
 
-## Frontend Technology
+No GPU, Docker, or paid services required for local dev.
 
--   React
--   TypeScript
--   Vite
--   Tailwind CSS
--   Browser audio APIs
+---
 
-## Frontend Responsibilities
+## Run from scratch (local)
 
-The frontend handles:
+### 1. Clone and enter the project
 
-1.  Selecting an audio file
-2.  Recording audio from the microphone
-3.  Converting/formatting recorded audio for the backend
-4.  Sending audio to the FastAPI `/predict` endpoint
-5.  Displaying prediction results
-6.  Displaying confidence and risk information
-7.  Providing the user interface for the VoiceShield workflow
-
-## Important Frontend Components
-
-### `UploadScreen.tsx`
-
-Responsible for audio upload/sample analysis.
-
-The component sends the selected audio to:
-
-``` text
-POST http://127.0.0.1:8000/predict
+```cmd
+git clone https://github.com/<you>/<your-repo>.git
+cd <your-repo>
 ```
 
-using multipart form data.
+### 2. Backend setup
 
-### `LiveDetectionScreen.tsx`
+From the project root (not inside `backend/`):
 
-Responsible for microphone-based detection.
-
-The browser records the user's voice and prepares it as PCM WAV audio
-before sending it to the local backend.
-
-### `DetailedAnalysisScreen.tsx`
-
-Displays the detailed analysis/results interface.
-
-------------------------------------------------------------------------
-
-# Backend
-
-The backend is responsible for receiving audio and running the
-machine-learning inference pipeline.
-
-## Backend Technology
-
--   Python
--   FastAPI
--   Uvicorn
--   NumPy
--   SoundFile
--   SciPy
--   ONNX Runtime
-
-## Backend Responsibilities
-
-The backend:
-
-1.  Receives uploaded/recorded audio
-2.  Validates the request
-3.  Loads and preprocesses the audio
-4.  Runs the local AntiDeepfake model
-5.  Converts model logits into probabilities
-6.  Determines REAL/SYNTHETIC prediction
-7.  Calculates risk level
-8.  Returns a JSON response to the frontend
-
-------------------------------------------------------------------------
-
-# Backend Files
-
-## `backend/app/main.py`
-
-This is the FastAPI application entry point.
-
-It provides the HTTP API used by the frontend.
-
-Important endpoint:
-
-``` text
-POST /predict
-```
-
-Health endpoint:
-
-``` text
-GET /health
-```
-
-------------------------------------------------------------------------
-
-## `backend/app/model_service.py`
-
-This is the ML inference service.
-
-Responsibilities include:
-
--   Loading the ONNX model
--   Loading audio
--   Converting audio to mono
--   Resampling audio to 16 kHz
--   Preparing the model input
--   Applying layer normalization
--   Running ONNX inference
--   Calculating probabilities
--   Returning REAL/SYNTHETIC prediction
-
-The model is loaded once and reused rather than being loaded for every
-request.
-
-------------------------------------------------------------------------
-
-## `backend/app/risk_engine.py`
-
-Converts the synthetic probability into a user-facing risk result.
-
-Current logic:
-
-``` text
-Synthetic probability × 100 = Risk Score
-```
-
-Risk levels:
-
-``` text
-0–30     LOW
-31–70    MEDIUM
-71–100   HIGH
-```
-
-------------------------------------------------------------------------
-
-# Machine Learning Pipeline
-
-The current inference pipeline is:
-
-``` text
-Audio
-  │
-  ▼
-Load audio
-  │
-  ▼
-Convert to mono
-  │
-  ▼
-Resample to 16 kHz
-  │
-  ▼
-Prepare 64,000 samples
-  │
-  ▼
-Layer normalization
-  │
-  ▼
-ONNX Runtime
-  │
-  ▼
-Wav2Vec2 AntiDeepfake
-  │
-  ▼
-Two logits
-  │
-  ├───────────────┐
-  ▼               ▼
-Synthetic        Real
-  │               │
-  └───────┬───────┘
-          ▼
-       Softmax
-          │
-          ▼
-   Prediction + Confidence
-          │
-          ▼
-      Risk Engine
-          │
-          ▼
-      API Response
-```
-
-The current ONNX model accepts:
-
-``` text
-Sample rate: 16,000 Hz
-Input size: 64,000 samples
-Duration: 4 seconds
-```
-
-For audio shorter than four seconds, the input is padded.
-
-For audio longer than four seconds, the current implementation uses the
-first four seconds.
-
-------------------------------------------------------------------------
-
-# API
-
-## Health Check
-
-``` http
-GET /health
-```
-
-Example:
-
-``` json
-{
-  "status": "ok",
-  "model_loaded": true,
-  "device": "cpu"
-}
-```
-
-------------------------------------------------------------------------
-
-## Prediction
-
-``` http
-POST /predict
-```
-
-Form field:
-
-``` text
-file
-```
-
-Example:
-
-``` cmd
-curl -X POST "http://127.0.0.1:8000/predict" -F "file=@frontend\public\samples\real_sample.wav"
-```
-
-Example response:
-
-``` json
-{
-  "prediction": "REAL",
-  "confidence": 0.9974889755249023,
-  "prob_synthetic": 0.0025110526476055384,
-  "prob_real": 0.9974889755249023,
-  "risk_score": 0,
-  "risk_level": "LOW",
-  "recommendation": "No significant indicators of synthetic audio detected.",
-  "processing_time_ms": 196,
-  "filename": "real_sample.wav"
-}
-```
-
-------------------------------------------------------------------------
-
-# Local Processing
-
-VoiceShield is designed to perform detection locally.
-
-``` text
-Browser
-   │
-   ▼
-Local FastAPI Server
-   │
-   ▼
-Local ONNX Model
-   │
-   ▼
-Local Result
-```
-
-The detection pipeline does not require a cloud AI API.
-
-------------------------------------------------------------------------
-
-# Current Validation
-
-The new model and backend were tested using known audio samples and a
-real voice recording.
-
-  Test                     Synthetic       Real Prediction
-  ---------------------- ----------- ---------- ------------
-  Known Real                 0.2511%   99.7489% REAL
-  Known Spoof               99.9956%    0.0044% SYNTHETIC
-  Real Voice Recording       0.1216%   99.8784% REAL
-
-The same audio was also successfully tested through the FastAPI
-`/predict` endpoint.
-
-------------------------------------------------------------------------
-
-# Setup
-
-## Requirements
-
-Recommended environment:
-
-``` text
-Windows 10 / Windows 11
-Python 3.11
-Node.js
-npm
-Git
-```
-
-------------------------------------------------------------------------
-
-# Backend Setup
-
-From the project root:
-
-``` cmd
-cd backend
-```
-
-Create the virtual environment if necessary:
-
-``` cmd
+```cmd
 python -m venv .venv
-```
-
-Activate it:
-
-``` cmd
 .venv\Scripts\activate
+pip install -r backend\requirements.txt
 ```
 
-Install Python dependencies:
+Start the backend:
 
-``` cmd
-pip install -r requirements.txt
-```
-
-If ONNX Runtime is not already included:
-
-``` cmd
-pip install onnxruntime
-```
-
-------------------------------------------------------------------------
-
-# Start Backend
-
-Run this command from the **project root**:
-
-``` cmd
+```cmd
 python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Expected:
+You should see:
 
-``` text
+```
 Uvicorn running on http://127.0.0.1:8000
+[model_service] WARNING: real model unavailable (...). Falling back to demo heuristic model.
 Application startup complete.
 ```
 
-API documentation:
+That warning is expected (see [Current status](#current-status-demo-mode)).
+Verify it's up:
 
-``` text
-http://127.0.0.1:8000/docs
+```cmd
+curl http://127.0.0.1:8000/health
 ```
 
-Health check:
+### 3. Frontend setup
 
-``` text
-http://127.0.0.1:8000/health
-```
+Open a **second terminal**, from the project root:
 
-------------------------------------------------------------------------
-
-# Frontend Setup
-
-Open a second terminal.
-
-Go to the frontend:
-
-``` cmd
-cd frontend
-```
-
-Install dependencies:
-
-``` cmd
-npm install
-```
-
-Start the development server:
-
-``` cmd
-npm run dev
-```
-
-Open the localhost address shown by Vite.
-
-Usually:
-
-``` text
-http://localhost:5173
-```
-
-------------------------------------------------------------------------
-
-# Complete Startup
-
-For a fresh clone:
-
-### Terminal 1 --- Backend
-
-From the project root:
-
-``` cmd
-.venv\Scripts\activate
-python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
-```
-
-### Terminal 2 --- Frontend
-
-``` cmd
+```cmd
 cd frontend
 npm install
 npm run dev
 ```
 
-Then open the Vite URL in the browser.
+This starts a custom Express+Vite dev server (`frontend/server.ts`) on
+**port 9990** (configurable via the `PORT` env var). Open:
 
-------------------------------------------------------------------------
+```
+http://localhost:9990
+```
 
-# Testing from Command Line
+The frontend talks to the backend at `http://127.0.0.1:8000` by default
+in local dev (see `frontend/src/config.ts`). No extra config needed for
+local use.
 
-## Known Real Sample
+### 4. Test detection end-to-end
 
-``` cmd
+Upload one of the bundled samples (`frontend/public/samples/real_sample.wav`
+or `spoof_sample.wav`) through the UI, or test the API directly:
+
+```cmd
 curl -X POST "http://127.0.0.1:8000/predict" -F "file=@frontend\public\samples\real_sample.wav"
 ```
 
-Expected:
+Remember: in demo mode, the result is a hash of the file, not real
+analysis.
 
-``` text
-Prediction: REAL
-Risk Level: LOW
+---
+
+## Getting the real ML model working
+
+You have two real options. Both are legitimate, neither is quick.
+
+### Option A — Obtain the original ONNX export
+
+If you (or your team) have the original `wav2vec2-small-antideepfake.onnx`
+file from wherever this project was first built (a teammate's machine, a
+private repo with Git LFS actually pulled, cloud storage, etc.):
+
+1. Place it at exactly:
+   ```
+   ml/models/antideepfake/wav2vec2-small-antideepfake.onnx
+   ```
+2. Restart the backend. `model_service.py` auto-detects a real ONNX
+   binary (as opposed to a Git LFS pointer or missing file) and switches
+   out of demo mode automatically — **no code changes needed**.
+3. Confirm via `/health` → `"demo_mode": false`.
+
+The model must accept input named `wav` of shape `(1, 64000)` (4 seconds
+@ 16kHz, layer-normalized) and return logits named `logits` of shape
+`(1, 2)` where index 0 = synthetic, index 1 = real. This matches the
+`nii-yamagishilab` AntiDeepfake family of models — if you're sourcing a
+replacement, verify the exported input/output names and shapes match, or
+adjust `backend/app/model_service.py` accordingly.
+
+### Option B — Train your own model from scratch
+
+The repo includes a full (if minimal) training pipeline for a baseline
+CNN classifier as an alternative to the Wav2Vec2 model:
+
+1. Get a labeled spoof-detection dataset. The standard public one is
+   **ASVspoof 2019 LA** (logical access), which has bonafide + spoofed
+   speech with train/dev/eval partitions.
+2. Set up ML dependencies (separate from the backend's):
+   ```cmd
+   pip install -r ml\requirements.txt
+   ```
+3. Build CSV manifests at `ml/data/processed/train.csv`, `dev.csv`,
+   `eval.csv`, each with columns `filepath,label` (`0` = spoof, `1` =
+   bonafide) pointing at your dataset's audio files. This step isn't
+   scripted in the repo — you write it based on your dataset's own
+   metadata format.
+4. Train:
+   ```cmd
+   python -m ml.training.train
+   ```
+   This trains `ml/models/cnn_baseline.py` (`AudioCNN`, a 3-block CNN
+   over 80-bin log-mel spectrograms) and saves the best checkpoint to
+   `ml/models/checkpoints/best_model.pt`.
+5. Evaluate on the held-out eval set (reports accuracy, precision,
+   recall, F1, ROC-AUC, EER):
+   ```cmd
+   python -m ml.evaluation.evaluate
+   ```
+6. Export the trained PyTorch model to ONNX (not scripted in the repo —
+   use `torch.onnx.export`), matching the input contract your backend
+   expects, or update `backend/app/model_service.py` to match your
+   model's actual input/output shapes and preprocessing (this baseline
+   CNN uses log-mel spectrograms, not raw waveform like Wav2Vec2 — the
+   current `model_service.py` is written for the Wav2Vec2 raw-waveform
+   contract, so you'll need to adjust it if you go this route).
+7. Place the resulting `.onnx` file per Option A step 1.
+
+This is genuine ML engineering work (dataset acquisition, training,
+tuning, export, integration) — budget real time for it.
+
+---
+
+## Deploy live (Netlify + Render, free)
+
+This setup is tested and working: frontend on Netlify, backend on Render,
+both free tier.
+
+### Backend on Render
+
+1. Push this repo to GitHub.
+2. On [render.com](https://render.com): New → Web Service → connect your
+   repo. Render auto-detects `render.yaml`:
+   - Build: `pip install -r backend/requirements.txt`
+   - Start: `uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT`
+   - Health check: `/health`
+3. Deploy. Note your backend URL, e.g. `https://your-app.onrender.com`.
+4. Confirm: `curl https://your-app.onrender.com/health`.
+
+Free tier spins down after ~15 min idle; the first request after that
+takes 30-50 seconds to wake up. This is normal.
+
+### Frontend on Netlify
+
+1. On [netlify.com](https://netlify.com): Add new site → Import from
+   GitHub → same repo. Netlify auto-detects `netlify.toml`:
+   - Base: `frontend`
+   - Build: `npm install && npx vite build`
+   - Publish: `dist` (resolves to `frontend/dist`)
+2. **Before deploying**, add an environment variable:
+   - Key: `VITE_API_BASE_URL`
+   - Value: your Render backend URL from above (no trailing slash)
+3. Deploy. Note your frontend URL, e.g. `https://your-app.netlify.app`.
+
+### Connect them (CORS)
+
+The backend only accepts requests from origins it explicitly allows.
+On Render → your service → **Environment**, add:
+
+- Key: `FRONTEND_ORIGINS`
+- Value: your exact Netlify URL, e.g. `https://your-app.netlify.app`
+  (comma-separate multiple origins if needed; no trailing slash, no
+  extra text — just the bare URL)
+
+Save. Render redeploys automatically (~1-2 min). Verify:
+
+```cmd
+curl -i -X OPTIONS "https://your-app.onrender.com/predict" -H "Origin: https://your-app.netlify.app" -H "Access-Control-Request-Method: POST"
 ```
 
-## Known Spoof Sample
+Look for `access-control-allow-origin: https://your-app.netlify.app` and
+`200 OK` in the response. If you instead see `Disallowed CORS origin`,
+`FRONTEND_ORIGINS` isn't set correctly — check for typos, trailing
+slashes, or stray text pasted into the value field.
 
-``` cmd
-curl -X POST "http://127.0.0.1:8000/predict" -F "file=@frontend\public\samples\spoof_sample.wav"
+---
+
+## API reference
+
+### `GET /health`
+
+```json
+{ "status": "ok", "model_loaded": true, "device": "CPU", "demo_mode": true }
 ```
 
-Expected:
+### `GET /model-info`
 
-``` text
-Prediction: SYNTHETIC
-Risk Level: HIGH
+Returns which model is active and basic metadata (demo heuristic or real
+ONNX model).
+
+### `GET /history`
+
+Returns the most recent scans (in-memory only, resets on server restart).
+
+### `POST /predict`
+
+Multipart form field `file` (wav/mp3/flac/m4a/ogg/webm/mp4, max 20MB).
+
+```cmd
+curl -X POST "http://127.0.0.1:8000/predict" -F "file=@frontend\public\samples\real_sample.wav"
 ```
 
-------------------------------------------------------------------------
-
-# Machine Learning Model Attribution
-
-VoiceShield currently uses a locally deployed ONNX version of the:
-
-``` text
-Wav2Vec2-Small-AntiDeepfake
+```json
+{
+  "prediction": "REAL",
+  "confidence": 0.91,
+  "prob_synthetic": 0.09,
+  "prob_real": 0.91,
+  "risk_score": 9,
+  "risk_level": "LOW",
+  "recommendation": "No significant indicators of synthetic audio detected.",
+  "processing_time_ms": 1,
+  "filename": "real_sample.wav",
+  "timestamp": "2026-09-24T12:00:00+00:00"
+}
 ```
 
-model.
+---
 
-The underlying model is an existing research model. VoiceShield does
-**not** claim that the underlying neural network was trained from
-scratch by this project.
+## Troubleshooting
 
-The VoiceShield project itself includes the application integration,
-backend inference service, audio preprocessing pipeline, API, risk
-engine, frontend, and local deployment workflow.
+**"Failed to fetch" in the browser after deploying**
+Almost always CORS. Check `FRONTEND_ORIGINS` on Render matches your
+Netlify URL exactly (see [Connect them](#connect-them-cors) above).
 
-Model attribution and licensing information should be preserved when
-redistributing the model.
+**Netlify build fails: "Deploy directory ... does not exist"**
+`publish` in `netlify.toml` must be relative to `base`, not the repo
+root. If `base = "frontend"`, use `publish = "dist"`, not
+`publish = "frontend/dist"`.
 
-------------------------------------------------------------------------
+**Backend crashes on startup with a Git LFS / FileNotFoundError**
+Expected if the real ONNX file isn't present — but it should **not**
+crash the app; it should fall back to demo mode automatically. If it's
+actually crashing, check that `backend/app/model_service.py` hasn't been
+modified to remove the fallback in `get_model()`.
 
-# Future ML Work
+**Predictions seem random / your real voice shows as "AI"**
+You're in demo mode. See [Current status](#current-status-demo-mode).
 
-A future version of VoiceShield can move from using an existing
-pretrained anti-deepfake model to a project-specific trained/fine-tuned
-model.
+**`pip install` or scipy fails to import on Windows with an "Application
+Control policy" error**
+Some locked-down Windows environments (corporate policy, Smart App
+Control) block scipy's native DLLs. This project's audio resampling is
+implemented with numpy only (no scipy dependency) specifically to avoid
+this — make sure you're on the current `backend/requirements.txt` (no
+`scipy` entry).
 
-Potential workflow:
+---
 
-``` text
-Dataset
-   │
-   ▼
-Audio preprocessing
-   │
-   ▼
-Train / Fine-tune model
-   │
-   ▼
-Validation
-   │
-   ▼
-Held-out test set
-   │
-   ▼
-Evaluate
-   │
-   ├── Accuracy
-   ├── Precision
-   ├── Recall
-   ├── F1
-   ├── ROC-AUC
-   └── EER
-   │
-   ▼
-Export model
-   │
-   ▼
-ONNX
-   │
-   ▼
-VoiceShield
-```
-
-Once a project-specific model is trained and evaluated, it can replace
-the current model in:
-
-``` text
-ml/models/antideepfake/
-```
-
-------------------------------------------------------------------------
-
-# Limitations
-
-Voice deepfake detection is probabilistic and should not be considered
-absolute proof that audio is real or fake.
-
-Potential sources of errors include:
-
--   Background noise
--   Audio compression
--   Very short recordings
--   Poor microphone quality
--   Unseen voice-generation systems
--   Audio manipulation
--   Distribution differences between training and real-world audio
-
-The current ONNX model uses a fixed four-second input.
-
-Future versions should consider overlapping windows and score
-aggregation for longer recordings.
-
-------------------------------------------------------------------------
-
-# Project Goal
-
-The long-term goal of VoiceShield is to provide a practical,
-privacy-oriented voice deepfake detection system that can run locally
-without requiring users to upload sensitive voice recordings to external
-AI services.
-
-------------------------------------------------------------------------
-
-# Disclaimer
+## Disclaimer
 
 VoiceShield is intended for research, educational, and experimental
-purposes.
-
-A model prediction should not be treated as definitive proof of
-authenticity, fraud, or identity.
-
-For high-impact decisions, additional verification methods should always
-be used.
+purposes. Even with the real ML model active, a prediction is
+probabilistic and should not be treated as definitive proof of
+authenticity, fraud, or identity. For high-impact decisions, use
+additional verification methods.
